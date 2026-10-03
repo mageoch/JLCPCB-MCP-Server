@@ -70,9 +70,50 @@ def test_membership_never_populated_triggers_refresh(mocker):
     mock_client.get_parts_details.assert_called_once_with(["C1", "C2"])
     mock_db.import_batch.assert_called_once()
     mock_db.rebuild_fts.assert_called_once()
-    mock_db.set_metadata.assert_called_once()
-    key, _ = mock_db.set_metadata.call_args[0]
-    assert key == "basic_library_refreshed_at"
+    keys = [c.args[0] for c in mock_db.set_metadata.call_args_list]
+    assert keys == ["basic_library_refreshed_at", server.LIBRARY_TOTAL_KEY]
+    assert mock_db.set_metadata.call_args_list[1].args[1] == "2"
+
+
+def test_stub_progress_logger_first_load(mocker, caplog):
+    """No stored total → pages, codes and elapsed time only, every 50 pages."""
+    mock_db = mocker.MagicMock()
+    mock_db.get_metadata.return_value = None
+    cb = server._stub_progress_logger(mock_db, started_at=0)
+    mocker.patch("jlcpcb_mcp.server.time.time", return_value=120)
+    with caplog.at_level("INFO", logger="jlcpcb_mcp.server"):
+        for page in range(1, 101):
+            cb(page * 1000)
+    assert [r.getMessage() for r in caplog.records] == [
+        "Library list: page 50, 50000 codes, 2.0 min elapsed",
+        "Library list: page 100, 100000 codes, 2.0 min elapsed",
+    ]
+
+
+def test_stub_progress_logger_with_estimate(mocker, caplog):
+    """A stored total from the last refresh gives an estimated page count."""
+    mock_db = mocker.MagicMock()
+    mock_db.get_metadata.return_value = "120500"
+    cb = server._stub_progress_logger(mock_db, started_at=0)
+    mocker.patch("jlcpcb_mcp.server.time.time", return_value=60)
+    with caplog.at_level("INFO", logger="jlcpcb_mcp.server"):
+        for page in range(1, 51):
+            cb(page * 1000)
+    mock_db.get_metadata.assert_called_once_with(server.LIBRARY_TOTAL_KEY)
+    assert [r.getMessage() for r in caplog.records] == [
+        "Library list: page 50 / ~121 (est.), 50000 codes, 1.0 min elapsed",
+    ]
+
+
+def test_stub_progress_logger_empty_first_page(mocker, caplog):
+    """A first page reporting 0 codes must not divide by zero later."""
+    mock_db = mocker.MagicMock()
+    mock_db.get_metadata.return_value = "1000"
+    cb = server._stub_progress_logger(mock_db, started_at=0)
+    with caplog.at_level("INFO", logger="jlcpcb_mcp.server"):
+        for _ in range(50):
+            cb(0)
+    assert "/ ~1000 (est.)" in caplog.records[-1].getMessage()
 
 
 def test_membership_stale_with_age_in_message(mocker):
@@ -312,9 +353,8 @@ def test_download_library_success(mocker):
 
     result = server.download_library()
     assert result["success"] is True
-    mock_db.set_metadata.assert_called_once()
-    key, _ = mock_db.set_metadata.call_args[0]
-    assert key == "basic_library_refreshed_at"
+    keys = [c.args[0] for c in mock_db.set_metadata.call_args_list]
+    assert keys == ["basic_library_refreshed_at", server.LIBRARY_TOTAL_KEY]
     mock_db.rebuild_fts.assert_called_once()
     mock_db.rebuild_specs.assert_called_once()
 

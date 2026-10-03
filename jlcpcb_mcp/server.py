@@ -74,6 +74,37 @@ def _client() -> JLCPCBClient:
 # Cache refresh helpers
 # ---------------------------------------------------------------------------
 
+LIBRARY_TOTAL_KEY = "library_total_codes"
+PROGRESS_EVERY_PAGES = 50
+
+
+def _stub_progress_logger(db: PartsDB, started_at: float):
+    """on_progress callback for iter_library_stubs: logs every PROGRESS_EVERY_PAGES pages.
+
+    The page total is estimated from the last completed refresh; on the first
+    load there is none, so only pages / codes / elapsed time are shown.
+    """
+    last_total = db.get_metadata(LIBRARY_TOTAL_KEY)
+    state = {"page": 0, "page_size": None}
+
+    def on_progress(total: int) -> None:
+        state["page"] += 1
+        if state["page_size"] is None:
+            state["page_size"] = total or 1
+        if state["page"] % PROGRESS_EVERY_PAGES:
+            return
+        pages = f"page {state['page']}"
+        if last_total:
+            est_pages = -(-int(last_total) // state["page_size"])
+            pages += f" / ~{est_pages} (est.)"
+        logger.info(
+            "Library list: %s, %d codes, %.1f min elapsed",
+            pages, total, (time.time() - started_at) / 60,
+        )
+
+    return on_progress
+
+
 def _ensure_membership_fresh(db: PartsDB) -> Optional[str]:
     """
     If the library membership is older than MEMBERSHIP_TTL_HOURS or never
@@ -105,7 +136,9 @@ def _ensure_membership_fresh(db: PartsDB) -> Optional[str]:
         # 1. Fetch all stubs.
         api_codes = {
             stub["componentCode"]
-            for stub in client.iter_library_stubs()
+            for stub in client.iter_library_stubs(
+                on_progress=_stub_progress_logger(db, started_at)
+            )
             if stub.get("componentCode")
         }
         if not api_codes:
@@ -117,18 +150,23 @@ def _ensure_membership_fresh(db: PartsDB) -> Optional[str]:
 
         # 3. Enrich new codes (batches of 1000 handled inside the client).
         if new_codes:
+            logger.info("Library refresh: fetching details for %d new codes…", len(new_codes))
             details = client.get_parts_details(new_codes)
             db.import_batch(details)
 
         # 4. Drop codes that are no longer in the library (purges any
         #    leftover entries from earlier full-catalog imports too).
         removed = db.delete_codes_not_in(api_codes)
+        if removed:
+            logger.info("Library refresh: removed %d delisted codes", removed)
 
-        # 5. Rebuild FTS once at the end (cheap on tens of thousands of rows).
+        # 5. Rebuild FTS once at the end.
+        logger.info("Library refresh: rebuilding search index…")
         db.rebuild_fts()
 
-        # 6. Mark cache as fresh.
+        # 6. Mark cache as fresh; remember the size for the next progress estimate.
         db.set_metadata("basic_library_refreshed_at", str(started_at))
+        db.set_metadata(LIBRARY_TOTAL_KEY, str(len(api_codes)))
 
         elapsed = time.time() - started_at
         msg = (
@@ -247,6 +285,7 @@ def download_library() -> dict:
         # but rebuilding ensures specs reflect the latest descriptions.
         db.rebuild_specs()
         db.set_metadata("basic_library_refreshed_at", str(time.time()))
+        db.set_metadata(LIBRARY_TOTAL_KEY, str(total))
         stats = db.stats()
         return {
             "success": True,

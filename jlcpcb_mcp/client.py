@@ -32,6 +32,14 @@ ENDPOINT_LIB_LIST = f"{_BASE}/getComponentLibraryList"   # Basic/Extended librar
 # getComponentDetailByCode accepts up to 1000 codes per call.
 DETAIL_BATCH_MAX = 1000
 
+# Rate limiting: pause between paginated calls, backoff on 429 / 5xx
+# (2, 4, 8, … s, capped at 120 s → ~10 min total before giving up).
+PAGE_PAUSE_S = 1.0
+RETRY_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = 8
+BACKOFF_BASE_S = 2.0
+BACKOFF_MAX_S = 120.0
+
 
 def _require_env(name: str) -> str:
     value = os.getenv(name)
@@ -81,15 +89,33 @@ class JLCPCBClient:
         self._session.mount("https://", adapter)
 
     def _post(self, endpoint: str, payload: dict, timeout: int = 60) -> dict:
-        """Signed POST → returns response['data']."""
+        """Signed POST → returns response['data'].
+
+        Retries 429 / 5xx with exponential backoff (honours Retry-After).
+        The signature carries a timestamp + nonce, so it is rebuilt per attempt.
+        """
         body = json.dumps(payload, separators=(",", ":"))
-        auth = _auth_header(self.app_id, self.access_key, self.secret_key, "POST", endpoint, body)
-        resp = self._session.post(
-            f"{BASE_URL}{endpoint}",
-            headers={"Authorization": auth, "Content-Type": "application/json"},
-            data=body.encode(),
-            timeout=timeout,
-        )
+        attempt = 0
+        while True:
+            auth = _auth_header(self.app_id, self.access_key, self.secret_key, "POST", endpoint, body)
+            resp = self._session.post(
+                f"{BASE_URL}{endpoint}",
+                headers={"Authorization": auth, "Content-Type": "application/json"},
+                data=body.encode(),
+                timeout=timeout,
+            )
+            if resp.status_code not in RETRY_STATUS or attempt == MAX_RETRIES:
+                break
+            try:
+                delay = float(resp.headers.get("Retry-After", ""))
+            except ValueError:
+                delay = min(BACKOFF_BASE_S * 2 ** attempt, BACKOFF_MAX_S)
+            attempt += 1
+            logger.warning(
+                "JLCPCB %s → HTTP %d, retry %d/%d in %.0f s",
+                endpoint, resp.status_code, attempt, MAX_RETRIES, delay,
+            )
+            time.sleep(delay)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 200:
@@ -202,7 +228,7 @@ class JLCPCBClient:
             if not next_key:
                 break
             last_key = next_key
-            time.sleep(0.1)  # minimal rate limiting
+            time.sleep(PAGE_PAUSE_S)
 
     def download_library(
         self,
@@ -246,13 +272,13 @@ class JLCPCBClient:
 
             if on_progress:
                 on_progress(total, f"Library page {page}: {total} parts")
-            else:
+            elif page % 50 == 0:
                 logger.info("Library page %d: %d parts", page, total)
 
             if not next_key:
                 break
             last_key = next_key
 
-            time.sleep(0.1)
+            time.sleep(PAGE_PAUSE_S)
 
         return all_parts
