@@ -262,7 +262,9 @@ def test_refresh_stale_details_refetches_and_upserts(mocker):
     mock_client.get_parts_details.return_value = [{"lcscPart": "C1"}, {"lcscPart": "C2"}]
     mocker.patch("jlcpcb_mcp.server._client", return_value=mock_client)
     assert server._refresh_stale_details(mock_db, ["C1", "C2"]) == 2
-    mock_client.get_parts_details.assert_called_once_with(["C1", "C2"])
+    mock_client.get_parts_details.assert_called_once_with(
+        ["C1", "C2"], max_retries=server.INTERACTIVE_MAX_RETRIES
+    )
     mock_db.import_batch.assert_called_once()
 
 
@@ -607,6 +609,9 @@ def test_get_part_local_fresh_no_part_falls_through(mocker):
 
     result = server.get_part("C25744", live=False)
     assert result["source"] == "api"
+    mock_client.get_part_detail.assert_called_once_with(
+        "C25744", max_retries=server.INTERACTIVE_MAX_RETRIES
+    )
 
 
 def test_get_part_stale_uses_api(mocker):

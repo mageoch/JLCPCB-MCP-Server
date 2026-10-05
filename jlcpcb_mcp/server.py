@@ -75,6 +75,9 @@ def _client() -> JLCPCBClient:
 # ---------------------------------------------------------------------------
 
 LIBRARY_TOTAL_KEY = "library_total_codes"
+# Search / get_part answer the user directly: give up after ~6 s (2 + 4 s backoff)
+# on a persistent 429/5xx instead of the bulk default of several minutes.
+INTERACTIVE_MAX_RETRIES = 2
 PROGRESS_EVERY_PAGES = 50
 
 
@@ -199,7 +202,7 @@ def _refresh_stale_details(
         return 0
     try:
         client = _client()
-        details = client.get_parts_details(stale)
+        details = client.get_parts_details(stale, max_retries=INTERACTIVE_MAX_RETRIES)
         db.import_batch(details)
         return len(details)
     except Exception as exc:
@@ -608,7 +611,7 @@ def get_part(lcsc_code: str, live: bool = False) -> dict:
 
     try:
         client = _client()
-        raw = client.get_part_detail(lcsc_code)
+        raw = client.get_part_detail(lcsc_code, max_retries=INTERACTIVE_MAX_RETRIES)
         if not raw:
             part = db.get(lcsc_code)
             if part:
