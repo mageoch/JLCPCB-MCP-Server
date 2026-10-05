@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import secrets
 import string
@@ -31,6 +32,33 @@ ENDPOINT_LIB_LIST = f"{_BASE}/getComponentLibraryList"   # Basic/Extended librar
 
 # getComponentDetailByCode accepts up to 1000 codes per call.
 DETAIL_BATCH_MAX = 1000
+
+# Rate limiting. Paginated calls pause PAGE_PAUSE_MIN_S between pages; every 429
+# doubles the pause (up to PAGE_PAUSE_MAX_S) for the rest of that client's run.
+# 429 / 5xx responses are retried with exponential backoff (2, 4, 8, … s, capped
+# at 120 s): MAX_RETRIES for bulk paging, callers on interactive paths pass a
+# lower max_retries.
+PAGE_PAUSE_MIN_S = 0.1
+PAGE_PAUSE_MAX_S = 2.0
+RETRY_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = 8
+BACKOFF_BASE_S = 2.0
+BACKOFF_MAX_S = 120.0
+
+
+def _retry_delay(retry_after: Optional[str], attempt: int) -> float:
+    """Seconds to wait before the next attempt.
+
+    Uses the Retry-After header (seconds) when it is a finite number, clamped to
+    [0, BACKOFF_MAX_S]; otherwise exponential backoff capped at BACKOFF_MAX_S.
+    """
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError):
+        delay = math.nan
+    if not math.isfinite(delay):
+        delay = BACKOFF_BASE_S * 2 ** attempt
+    return min(max(delay, 0.0), BACKOFF_MAX_S)
 
 
 def _require_env(name: str) -> str:
@@ -79,17 +107,42 @@ class JLCPCBClient:
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=2, pool_maxsize=4)
         self._session.mount("https://", adapter)
+        self.page_pause = PAGE_PAUSE_MIN_S
 
-    def _post(self, endpoint: str, payload: dict, timeout: int = 60) -> dict:
-        """Signed POST → returns response['data']."""
+    def _post(
+        self,
+        endpoint: str,
+        payload: dict,
+        timeout: int = 60,
+        max_retries: int = MAX_RETRIES,
+    ) -> dict:
+        """Signed POST → returns response['data'].
+
+        Retries 429 / 5xx up to max_retries times with exponential backoff
+        (honours Retry-After). A 429 also slows down later page fetches.
+        The signature carries a timestamp + nonce, so it is rebuilt per attempt.
+        """
         body = json.dumps(payload, separators=(",", ":"))
-        auth = _auth_header(self.app_id, self.access_key, self.secret_key, "POST", endpoint, body)
-        resp = self._session.post(
-            f"{BASE_URL}{endpoint}",
-            headers={"Authorization": auth, "Content-Type": "application/json"},
-            data=body.encode(),
-            timeout=timeout,
-        )
+        attempt = 0
+        while True:
+            auth = _auth_header(self.app_id, self.access_key, self.secret_key, "POST", endpoint, body)
+            resp = self._session.post(
+                f"{BASE_URL}{endpoint}",
+                headers={"Authorization": auth, "Content-Type": "application/json"},
+                data=body.encode(),
+                timeout=timeout,
+            )
+            if resp.status_code == 429:
+                self.page_pause = min(self.page_pause * 2, PAGE_PAUSE_MAX_S)
+            if resp.status_code not in RETRY_STATUS or attempt >= max_retries:
+                break
+            delay = _retry_delay(resp.headers.get("Retry-After"), attempt)
+            attempt += 1
+            logger.warning(
+                "JLCPCB %s → HTTP %d, retry %d/%d in %.0f s",
+                endpoint, resp.status_code, attempt, max_retries, delay,
+            )
+            time.sleep(delay)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 200:
@@ -119,28 +172,29 @@ class JLCPCBClient:
             "price":          ",".join(price_parts),
         }
 
-    def get_part_detail(self, lcsc_code: str) -> Optional[dict]:
+    def get_part_detail(self, lcsc_code: str, max_retries: int = MAX_RETRIES) -> Optional[dict]:
         """
         Fetch live detail for a single component by LCSC code (e.g. 'C25804').
         Returns the component dict normalized to catalog format, None if not found,
         or raises RuntimeError on API/auth errors.
         """
-        results = self.get_parts_details([lcsc_code])
+        results = self.get_parts_details([lcsc_code], max_retries=max_retries)
         return results[0] if results else None
 
-    def get_parts_details(self, codes: list[str]) -> list[dict]:
+    def get_parts_details(self, codes: list[str], max_retries: int = MAX_RETRIES) -> list[dict]:
         """
         Batch-fetch full details for a list of LCSC codes.
 
         Splits the call into chunks of DETAIL_BATCH_MAX (1000) — the API's per-call limit.
         Returns a list of dicts normalized to the catalog format.
+        Pass a low max_retries on interactive paths so a persistent 5xx fails fast.
         """
         if not codes:
             return []
         out: list[dict] = []
         for i in range(0, len(codes), DETAIL_BATCH_MAX):
             chunk = codes[i:i + DETAIL_BATCH_MAX]
-            data = self._post(ENDPOINT_DETAIL, {"componentCodes": chunk})
+            data = self._post(ENDPOINT_DETAIL, {"componentCodes": chunk}, max_retries=max_retries)
             items = (
                 data.get("componentDetailResponseVOList", [])
                 if isinstance(data, dict)
@@ -202,7 +256,7 @@ class JLCPCBClient:
             if not next_key:
                 break
             last_key = next_key
-            time.sleep(0.1)  # minimal rate limiting
+            time.sleep(self.page_pause)
 
     def download_library(
         self,
@@ -246,13 +300,13 @@ class JLCPCBClient:
 
             if on_progress:
                 on_progress(total, f"Library page {page}: {total} parts")
-            else:
+            elif page % 50 == 0:
                 logger.info("Library page %d: %d parts", page, total)
 
             if not next_key:
                 break
             last_key = next_key
 
-            time.sleep(0.1)
+            time.sleep(self.page_pause)
 
         return all_parts

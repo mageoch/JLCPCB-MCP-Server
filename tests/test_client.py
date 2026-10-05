@@ -5,9 +5,14 @@ import hmac
 import string
 
 import pytest
+import requests
 
 from jlcpcb_mcp.client import (
+    BACKOFF_MAX_S,
     DETAIL_BATCH_MAX,
+    MAX_RETRIES,
+    PAGE_PAUSE_MAX_S,
+    PAGE_PAUSE_MIN_S,
     JLCPCBClient,
     _auth_header,
     _nonce,
@@ -106,6 +111,138 @@ def test_post_empty_data(client, mocker):
     resp = _mock_response(mocker, {"code": 200, "data": None})
     mocker.patch.object(client._session, "post", return_value=resp)
     assert client._post("/ep", {}) == {}
+
+
+def _status_response(mocker, status, headers=None):
+    resp = _mock_response(mocker, {"code": 200, "data": {"ok": True}})
+    resp.status_code = status
+    resp.headers = headers or {}
+    return resp
+
+
+def test_post_retries_429_with_backoff(client, mocker):
+    sleep = mocker.patch("jlcpcb_mcp.client.time.sleep")
+    responses = [_status_response(mocker, 429), _status_response(mocker, 504), _status_response(mocker, 200)]
+    post = mocker.patch.object(client._session, "post", side_effect=responses)
+    assert client._post("/ep", {}) == {"ok": True}
+    assert post.call_count == 3
+    assert [c.args[0] for c in sleep.call_args_list] == [2.0, 4.0]
+
+
+def test_post_retry_honours_retry_after(client, mocker):
+    sleep = mocker.patch("jlcpcb_mcp.client.time.sleep")
+    responses = [_status_response(mocker, 429, {"Retry-After": "7"}), _status_response(mocker, 200)]
+    mocker.patch.object(client._session, "post", side_effect=responses)
+    client._post("/ep", {})
+    sleep.assert_called_once_with(7.0)
+
+
+def test_post_backoff_is_capped(client, mocker):
+    sleep = mocker.patch("jlcpcb_mcp.client.time.sleep")
+    responses = [_status_response(mocker, 503) for _ in range(MAX_RETRIES)] + [_status_response(mocker, 200)]
+    mocker.patch.object(client._session, "post", side_effect=responses)
+    client._post("/ep", {})
+    assert max(c.args[0] for c in sleep.call_args_list) == BACKOFF_MAX_S
+
+
+def test_post_gives_up_after_max_retries(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    last = _status_response(mocker, 429)
+    last.raise_for_status.side_effect = requests.HTTPError("429 Too Many Requests")
+    responses = [_status_response(mocker, 429) for _ in range(MAX_RETRIES)] + [last]
+    post = mocker.patch.object(client._session, "post", side_effect=responses)
+    with pytest.raises(requests.HTTPError):
+        client._post("/ep", {})
+    assert post.call_count == MAX_RETRIES + 1
+
+
+def test_post_no_retry_on_client_error(client, mocker):
+    sleep = mocker.patch("jlcpcb_mcp.client.time.sleep")
+    resp = _status_response(mocker, 403)
+    resp.raise_for_status.side_effect = requests.HTTPError("403 Forbidden")
+    post = mocker.patch.object(client._session, "post", return_value=resp)
+    with pytest.raises(requests.HTTPError):
+        client._post("/ep", {})
+    assert post.call_count == 1
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("header, expected", [
+    ("7", 7.0),
+    ("100000", BACKOFF_MAX_S),   # huge value is capped
+    ("-5", 0.0),                 # negative is clamped, time.sleep must not raise
+    ("inf", 2.0),                # not finite -> normal backoff (attempt 0)
+    ("nan", 2.0),
+    ("Wed, 21 Oct 2026 07:28:00 GMT", 2.0),  # HTTP-date form -> normal backoff
+])
+def test_post_retry_after_is_clamped(client, mocker, header, expected):
+    sleep = mocker.patch("jlcpcb_mcp.client.time.sleep")
+    responses = [_status_response(mocker, 429, {"Retry-After": header}), _status_response(mocker, 200)]
+    mocker.patch.object(client._session, "post", side_effect=responses)
+    client._post("/ep", {})
+    sleep.assert_called_once_with(expected)
+
+
+def test_post_max_retries_parameter(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    last = _status_response(mocker, 503)
+    last.raise_for_status.side_effect = requests.HTTPError("503")
+    responses = [_status_response(mocker, 503), _status_response(mocker, 503), last]
+    post = mocker.patch.object(client._session, "post", side_effect=responses)
+    with pytest.raises(requests.HTTPError):
+        client._post("/ep", {}, max_retries=2)
+    assert post.call_count == 3
+
+
+def test_post_zero_retries_fails_immediately(client, mocker):
+    sleep = mocker.patch("jlcpcb_mcp.client.time.sleep")
+    resp = _status_response(mocker, 503)
+    resp.raise_for_status.side_effect = requests.HTTPError("503")
+    post = mocker.patch.object(client._session, "post", return_value=resp)
+    with pytest.raises(requests.HTTPError):
+        client._post("/ep", {}, max_retries=0)
+    assert post.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_page_pause_starts_fast_and_doubles_on_429(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    assert client.page_pause == PAGE_PAUSE_MIN_S
+    responses = [_status_response(mocker, 429), _status_response(mocker, 200)]
+    mocker.patch.object(client._session, "post", side_effect=responses)
+    client._post("/ep", {})
+    assert client.page_pause == PAGE_PAUSE_MIN_S * 2
+
+
+def test_page_pause_not_raised_by_5xx(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    responses = [_status_response(mocker, 503), _status_response(mocker, 200)]
+    mocker.patch.object(client._session, "post", side_effect=responses)
+    client._post("/ep", {})
+    assert client.page_pause == PAGE_PAUSE_MIN_S
+
+
+def test_page_pause_is_capped(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    responses = [_status_response(mocker, 429) for _ in range(MAX_RETRIES)] + [_status_response(mocker, 200)]
+    mocker.patch.object(client._session, "post", side_effect=responses)
+    client._post("/ep", {})
+    assert client.page_pause == PAGE_PAUSE_MAX_S
+
+
+def test_iter_library_stubs_sleeps_current_page_pause(client, mocker):
+    sleep = mocker.patch("jlcpcb_mcp.client.time.sleep")
+    client.page_pause = 0.8
+    pages = [([_make_stub("C1")], "k1"), ([_make_stub("C2")], None)]
+    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    list(client.iter_library_stubs())
+    sleep.assert_called_once_with(0.8)
+
+
+def test_get_part_detail_passes_max_retries(client, mocker):
+    post = mocker.patch.object(client, "_post", return_value={"componentDetailResponseVOList": []})
+    client.get_part_detail("C1", max_retries=2)
+    assert post.call_args.kwargs["max_retries"] == 2
 
 
 def test_post_api_error_message(client, mocker):
@@ -243,7 +380,7 @@ def test_get_parts_details_chunks_above_limit(client, mocker):
     codes = [f"C{i}" for i in range(DETAIL_BATCH_MAX + 5)]
     captured: list[list[str]] = []
 
-    def _fake_post(_endpoint, payload):
+    def _fake_post(_endpoint, payload, **_kwargs):
         captured.append(list(payload["componentCodes"]))
         return {"componentDetailResponseVOList": [
             {**_SAMPLE_DETAIL, "componentCode": c} for c in payload["componentCodes"]
@@ -405,6 +542,17 @@ def test_download_library_progress(client, mocker):
     calls = []
     client.download_library(on_progress=lambda t, m: calls.append(t))
     assert calls == [1]
+
+
+def test_download_library_logs_every_50_pages(client, mocker, caplog):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    pages = [([_make_stub(f"C{i}")], f"k{i}") for i in range(1, 100)] + [([_make_stub("C100")], None)]
+    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    mocker.patch.object(client, "get_parts_details", side_effect=lambda codes: [{"lcscPart": c} for c in codes])
+    with caplog.at_level("INFO", logger="jlcpcb_mcp.client"):
+        client.download_library(on_batch=lambda parts: None)
+    logged = [r.getMessage() for r in caplog.records if "Library page" in r.getMessage()]
+    assert logged == ["Library page 50: 50 parts", "Library page 100: 100 parts"]
 
 
 def test_download_library_empty_first_page(client, mocker):
